@@ -1,0 +1,481 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: >-
+  Veeam Backup for Salesforce CF Template: Deploy VB4 SF instance.
+  **WARNING** This template creates an Veeam Backup for Salesforce Instance . You
+  will be billed for the AWS resources used if you create a stack from this
+  template.  Approx 10 minutes to do #
+Metadata:
+  'AWS::CloudFormation::Interface':
+    ParameterGroups:
+      - Label:
+          default: Instance Configuration
+        Parameters:
+          - InstanceType
+          - KeyName
+      - Label:
+          default: Network Configuration
+        Parameters:
+          - CreateEIP
+          - HTTPLocation
+      - Label:
+          default: VPC and Subnet
+        Parameters:
+          - VpcCidr
+          - SubnetCidr
+    ParameterLabels:
+      InstanceType:
+        default: Instance type for Veeam Backup for Salesforce
+      KeyName:
+        default: Key pair for Veeam Backup for Salesforce
+      CreateEIP:
+        default: Create elastic IP for Veeam Backup for Salesforce?
+      HTTPLocation:
+        default: Allowed source IP addresses for connection to HTTPS/SSH
+      VpcCidr:
+        default: VPC CIDR
+      SubnetCidr:
+        default: Subnet CIDR
+Parameters:
+  FilePath:
+    Type: String
+    Default: "/opt/vbsf/access_token.txt"
+    Description: "The file path where the access token is stored on the EC2 instance." # address for initial configuration
+  ElasticIP:
+    Type: String
+    Default: "96.41.70.236/32"
+    Description: "The Elastic IP address associated with the EC2 instance, if any."
+  KeyName:
+    Description: 'Select one, or create a new one at AWS console'
+    Type: 'AWS::EC2::KeyPair::KeyName'
+    ConstraintDescription: must be the name of an existing EC2 KeyPair.
+  #Jammy Build 22.04 LTS  https://ubuntu.com/tutorials/build-your-cloudformation-templates-with-the-latest-ubuntu-ami#3-putting-all-together
+  LatestAmiId:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/canonical/ubuntu/server/jammy/stable/current/amd64/hvm/ebs-gp2/ami-id'
+  InstanceType:
+    Description: '' #add a description about what size to PIC for a POC for Orgs based on this datasize 
+    Type: String
+    Default: t3.medium
+    AllowedValues:
+      - t2.medium
+      - t2.large
+      - t2.xlarge
+      - t2.2xlarge
+      - t3.medium
+      - t3.large
+      - t3.xlarge
+    ConstraintDescription: must be a valid EC2 instance type.
+  CreateEIP:
+    Description: >-
+      By default a dynamic IP will be created (and it could change during
+      reboots of this instance)
+    Default: 'false'
+    Type: String
+    AllowedValues:
+      - true
+      - false
+  HTTPLocation:
+    Description: >-
+      The IP address range in CIDR format (e.g. 12.23.34.0/24) from which Veeam
+      Backup for Salesforce portal will be accessible
+    Type: String
+    MinLength: '9'
+    MaxLength: '18'
+    AllowedPattern: '(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})/(\d{1,2})'
+    ConstraintDescription: must be a valid IP CIDR range of the form x.x.x.x/x
+  VpcCidr:
+    AllowedPattern: '(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})/(\d{1,2})'
+    Default: 172.28.0.0/16
+    Description: >-
+      Specify the IPv4 address range as a Classless Inter-Domain Routing (CIDR)
+      block; for example, 172.28.0.0/16. You cannot specify an IPv4 CIDR block
+      larger than /16.
+    Type: String
+  SubnetCidr:
+    AllowedPattern: '(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})/(\d{1,2})'
+    Default: 172.28.0.0/20
+    Description: Primary Public Subnet CIDR (Must be within VPC CIDR range).
+    Type: String
+Conditions:
+  CreateEIPCond: !Equals 
+    - !Ref CreateEIP
+    - 'true'
+  IsGovCloud: !Or 
+    - !Equals 
+      - !Ref 'AWS::Region'
+      - us-gov-east-1
+    - !Equals 
+      - !Ref 'AWS::Region'
+      - us-gov-west-1
+Resources:
+  VSBRebootAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmDescription: >-
+        Trigger a reboot when instance status check fails for 3 consecutive
+        minutes.
+      Namespace: AWS/EC2
+      MetricName: StatusCheckFailed_Instance
+      Statistic: Minimum
+      Period: '60'
+      EvaluationPeriods: '3'
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: '0'
+      AlarmActions:
+        - !Join 
+          - ''
+          - - 'arn:'
+            - !If 
+              - IsGovCloud
+              - aws-us-gov
+              - aws
+            - ':automate:'
+            - !Ref 'AWS::Region'
+            - ':ec2:reboot'
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref VSBEc2Instance
+  VSBRecoveryAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmDescription: >-
+        Trigger a recovery when system status check fails for 15 consecutive
+        minutes.
+      Namespace: AWS/EC2
+      MetricName: StatusCheckFailed_System
+      Statistic: Minimum
+      Period: '60'
+      EvaluationPeriods: '2'
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: '0'
+      AlarmActions:
+        - !Join 
+          - ''
+          - - 'arn:'
+            - !If 
+              - IsGovCloud
+              - aws-us-gov
+              - aws
+            - ':automate:'
+            - !Ref 'AWS::Region'
+            - ':ec2:recover'
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref VSBEc2Instance
+  VSBLifecyclePolicy:
+    Type: 'AWS::DLM::LifecyclePolicy'
+    Properties:
+      Description: Lifecycle Policy for a Veeam Cloud Backup instance
+      State: ENABLED
+      ExecutionRoleArn: !GetAtt 
+        - VSBSnapshotsRole
+        - Arn
+      PolicyDetails:
+        ResourceTypes:
+          - INSTANCE
+        TargetTags:
+          - Key: 'aws:cloudformation:stack-name'
+            Value: !Ref 'AWS::StackName'
+        Schedules:
+          - Name: VSB instance daily snapshots
+            TagsToAdd:
+              - Key: type
+                Value: VSBDailySnapshot
+            CreateRule:
+              Interval: 12
+              IntervalUnit: HOURS
+              Times:
+                - '03:00'
+            RetainRule:
+              Count: 1
+            CopyTags: true
+  VSBSnapshotsRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - dlm.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: VSB-describe-snap
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'ec2:DescribeVolumes'
+                  - 'ec2:DescribeInstances'
+                  - 'ec2:DescribeSnapshots'
+                Resource: '*'
+        - PolicyName: VSB-modify-snap
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'ec2:DeleteSnapshot'
+                  - 'ec2:CreateTags'
+                Resource: !Join 
+                  - ''
+                  - - 'arn:'
+                    - !If 
+                      - IsGovCloud
+                      - aws-us-gov
+                      - aws
+                    - ':ec2:'
+                    - !Ref 'AWS::Region'
+                    - '::snapshot/*'
+              - Action:
+                  - 'ec2:CreateSnapshot'
+                  - 'ec2:CreateSnapshots'
+                Resource: '*'
+                Effect: Allow
+  EC2InstanceRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Policies:
+        - PolicyName: EC2SSMPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'ssm:PutParameter'
+                Resource: '*'
+  EC2InstanceProfile:
+    Type: 'AWS::IAM::InstanceProfile'
+    Properties:
+      Roles:
+        - Ref: EC2InstanceRole
+  VSBEc2Instance:            
+    Type: 'AWS::EC2::Instance'
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT10M #set approrpirate timeout value
+        Count: '1'
+    Metadata:
+      AWS::CloudFormation::Init:
+        configSets:
+          full_install:
+            - install_and_enable_cfn_hup
+        install_and_enable_cfn_hup:
+          files:
+            /etc/cfn/cfn-hup.conf:
+              content: !Join 
+                - ''
+                - - |
+                    [main]
+                  - stack=
+                  - !Ref 'AWS::StackId'
+                  - |+
+
+                  - region=
+                  - !Ref 'AWS::Region'
+                  - |+
+
+              mode: '000400'
+              owner: root
+              group: root
+            /etc/cfn/hooks.d/cfn-auto-reloader.conf:
+              content: !Join 
+                - ''
+                - - |
+                    [cfn-auto-reloader-hook]
+                  - |
+                    triggers=post.update
+                  - >
+                    path=Resources.WebServerInstance.Metadata.AWS::CloudFormation::Init
+                  - 'action=/opt/aws/bin/cfn-init -v '
+                  - '         --stack '
+                  - !Ref 'AWS::StackName'
+                  - '         --resource WebServerInstance '
+                  - '         --configsets InstallAndRun '
+                  - '         --region '
+                  - !Ref 'AWS::Region'
+                  - |+
+
+                  - |
+                    runas=root
+              mode: '000400'
+              owner: root
+              group: root
+            /lib/systemd/system/cfn-hup.service:
+              content:
+                Fn::Join:
+                - ''
+                - - "[Unit]\n"
+                  - "Description=cfn-hup daemon\n\n"
+                  - "[Service]\n"
+                  - 'Type=simple
+
+                    '
+                  - 'ExecStart=/usr/local/bin/cfn-hup
+
+                    '
+                  - "Restart=always\n\n"
+                  - "[Install]\n"
+                  - WantedBy=multi-user.target
+          commands:
+            01enable_cfn_hup:
+              command: systemctl enable cfn-hup.service
+            02start_cfn_hup:
+              command: systemctl start cfn-hup.service
+    Properties:
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      SecurityGroupIds:
+        - !Ref VSBSecurityGroup
+      KeyName: !Ref KeyName
+      ImageId: !Ref LatestAmiId
+      SubnetId: !Ref VSBSubnet
+      UserData:
+        Fn::Base64: !Sub | #manual installation method
+            #!/bin/bash -xe 
+            sudo apt update -y
+            sudo apt-get install -y awscli
+            sudo localectl set-locale LANG=en_US.UTF-8
+            sudo update-locale
+            sudo curl http://repository.veeam.com/apt/stable/amd64/veeam-repo_1.0.0-13_amd64.deb --output veeam-repo.deb
+            sudo apt install -y ./veeam-repo.deb
+            sudo apt-get -y update
+            sudo apt install -y vbsf
+            sudo bash /opt/vbsf/server-configuration.sh --overwrite_nginx_config y -p y --restart_firewall y 
+            region=${AWS::Region}
+            token=$(grep "access_token" ${FilePath} | awk -F= '{print $2}')
+            aws ssm put-parameter --name "/MyApp/UniqueCode" --value "$token" --type "String" --overwrite --region $region
+            sudo apt-get -y install python3-pip
+            sudo mkdir -p /opt/aws/
+            sudo pip3 install https://s3.amazonaws.com/cloudformation-examples/aws-cfn-bootstrap-py3-latest.tar.gz
+            sudo ln -s /usr/local/init/ubuntu/cfn-hup /etc/init.d/cfn-hup
+            sudo /usr/local/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource VSBEc2Instance --region ${AWS::Region}
+      Tags:
+        - Key: Name
+          Value: !Ref 'AWS::StackName'
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: '30'      
+  VSBEIP:
+    Type: 'AWS::EC2::EIP'
+    Condition: CreateEIPCond
+    Properties:
+      Domain: vpc
+  VSBEIPAssociation:
+    Type: 'AWS::EC2::EIPAssociation'
+    Condition: CreateEIPCond
+    Properties:
+      AllocationId: !GetAtt 
+        - VSBEIP
+        - AllocationId
+      InstanceId: !Ref VSBEc2Instance
+  VSBSubnet:
+    Properties:
+      CidrBlock: !Ref SubnetCidr
+      MapPublicIpOnLaunch: 'true'
+      VpcId: !Ref VSBVPC
+      Tags:
+        - Key: Name
+          Value: !Join 
+            - ' '
+            - - !Ref 'AWS::StackName'
+              - Subnet
+    Type: 'AWS::EC2::Subnet'
+  VSBVPC:
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: 'true'
+      EnableDnsHostnames: 'true'
+      Tags:
+        - Key: Name
+          Value: !Join 
+            - ' '
+            - - !Ref 'AWS::StackName'
+              - VPC
+    Type: 'AWS::EC2::VPC'
+  VSBInternetGateway:
+    Type: 'AWS::EC2::InternetGateway'
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Join 
+            - ' '
+            - - !Ref 'AWS::StackName'
+              - InternetGateway
+  VSBGatewayAttachment:
+    Type: 'AWS::EC2::VPCGatewayAttachment'
+    Properties:
+      VpcId: !Ref VSBVPC
+      InternetGatewayId: !Ref VSBInternetGateway
+  VSBRouteTable:
+    Properties:
+      VpcId: !Ref VSBVPC
+      Tags:
+        - Key: Name
+          Value: !Join 
+            - ' '
+            - - !Ref 'AWS::StackName'
+              - RouteTable
+    Type: 'AWS::EC2::RouteTable'
+  VSBRouteToGateway:
+    Type: 'AWS::EC2::Route'
+    DependsOn: VSBGatewayAttachment
+    Properties:
+      DestinationCidrBlock: 0.0.0.0/0
+      RouteTableId: !Ref VSBRouteTable
+      GatewayId: !Ref VSBInternetGateway
+  VSBRouteTableAssociation:
+    Type: 'AWS::EC2::SubnetRouteTableAssociation'
+    Properties:
+      RouteTableId: !Ref VSBRouteTable
+      SubnetId: !Ref VSBSubnet
+  VSBSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: Enable HTTPS and SSH access via ports 443 and 22
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: '443'
+          ToPort: '443'
+          CidrIp: !Ref HTTPLocation
+        - IpProtocol: tcp
+          FromPort: '22'
+          ToPort: '22'
+          CidrIp: !Ref HTTPLocation  # Change this if necessary to restrict SSH access to specific IPs
+      VpcId: !Ref VSBVPC
+Outputs:
+  ConfigurationSetup:
+    Value: !If 
+      - CreateEIPCond
+      - !Sub 
+          - "https://${PublicIp}/?access_token=${UniqueCode}"
+          - PublicIp: !GetAtt VSBEc2Instance.PublicIp
+            UniqueCode: '{{resolve:ssm:MyApp/UniqueCode}}'
+      - !Sub 
+          - "https://${PrivateIp}/?access_token=${UniqueCode}"
+          - PrivateIp: !GetAtt VSBEc2Instance.PrivateIp
+            UniqueCode: '{{resolve:ssm:MyApp/UniqueCode}}'
+    Description: 'Configuration Setup URL'
+  MyUrlOutput:
+    Value: '{{resolve:ssm:MyApp/UniqueCode}}'
+    Description: 'The URL from /opt/vbsf/access_token.txt'
+  PublicIp:
+    Description: Public IP of the newly created VSB EC2 instance
+    Value: !GetAtt VSBEc2Instance.PublicIp
+  PrivateIp:
+    Description: Private IP of the newly created VSB EC2 instance
+    Value: !GetAtt VSBEc2Instance.PrivateIp
